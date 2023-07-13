@@ -168,7 +168,6 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        output_type: Optional[str] = "pil",
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
@@ -221,9 +220,6 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
                 Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
                 weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
                 argument.
-            output_type (`str`, *optional*, defaults to `"pil"`):
-                The output format of the generate image. Choose between
-                [PIL](https://pillow.readthedocs.io/en/stable/): `PIL.Image.Image` or `np.array`.
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] instead of a
                 plain tuple.
@@ -272,6 +268,7 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
             list of `bool`s denoting whether the corresponding generated image likely represents "not-safe-for-work"
             (nsfw) content, according to the `safety_checker`.
         """
+        output_type = 'latent'
         # 0. Check inputs
         self.check_inputs(prompt, callback_steps, negative_prompt, prompt_embeds, negative_prompt_embeds)
 
@@ -357,7 +354,7 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
         # 8.5 Prepare mask
         mask = torch.from_numpy(mask).float().to(latents.device).unsqueeze(0).unsqueeze(0)
         mask = torch.nn.functional.interpolate(mask, [64, 64], mode='bilinear').half()
-        mask = mask * guidance_scale
+        masked_guidance_scale = mask * guidance_scale
 
 
         # 9. Denoising loop
@@ -392,7 +389,7 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
                     noise_pred_text, noise_pred_image, noise_pred_uncond = noise_pred.chunk(3)
                     noise_pred = (
                         noise_pred_uncond
-                        + mask * (noise_pred_text - noise_pred_image)
+                        + masked_guidance_scale * (noise_pred_text - noise_pred_image)
                         + image_guidance_scale * (noise_pred_image - noise_pred_uncond)
                     )
 
@@ -414,19 +411,15 @@ class StableDiffusionMaskedInstructPix2PixPipeline(DiffusionPipeline, TextualInv
                     if callback is not None and i % callback_steps == 0:
                         callback(i, t, latents)
 
-        if not output_type == "latent":
-            image = self.vae.decode(latents / self.vae.config.scaling_factor, return_dict=False)[0]
-            image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
-        else:
-            image = latents
-            has_nsfw_concept = None
+        image = self.vae.decode(mask * latents / self.vae.config.scaling_factor + (1 - mask) * image_latents, return_dict=False)[0]
+        image, has_nsfw_concept = self.run_safety_checker(image, device, prompt_embeds.dtype)
 
         if has_nsfw_concept is None:
             do_denormalize = [True] * image.shape[0]
         else:
             do_denormalize = [not has_nsfw for has_nsfw in has_nsfw_concept]
 
-        image = self.image_processor.postprocess(image, output_type=output_type, do_denormalize=do_denormalize)
+        image = self.image_processor.postprocess(image, output_type='pil', do_denormalize=do_denormalize)
 
         # Offload last model to CPU
         if hasattr(self, "final_offload_hook") and self.final_offload_hook is not None:
